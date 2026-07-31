@@ -1,0 +1,13 @@
+langgraph
+langchain
+langchain_ollama
+langchain_community
+streamlit
+langgraph-checkpoint-sqlite
+dotenv
+ddgs
+pypdf
+faiss-cpu
+langgraph-checkpoint-postgres 
+pydantic
+psycopg[binary,pool]
