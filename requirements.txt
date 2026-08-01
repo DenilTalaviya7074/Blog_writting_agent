@@ -11,3 +11,4 @@ faiss-cpu
 langgraph-checkpoint-postgres 
 pydantic
 psycopg[binary,pool]
+langchain-tavily
