@@ -311,6 +311,29 @@ Code:
 - If requires_code==true, include at least one minimal snippet.
 """
 
+def _clean_section_heading(section_md: str, fallback_title: str) -> str:
+    """
+    Defensive cleanup for small-model prompt-following slips:
+    - Strips a literal leaked "<Section Title>" placeholder if the model echoed it back.
+    - Guarantees the section starts with a proper '## ' Markdown heading.
+    """
+    text = section_md.strip()
+
+    # Remove a literal leaked placeholder like "<Section Title>" (any casing/spacing)
+    text = re.sub(r"<\s*section\s*title\s*>", "", text, flags=re.IGNORECASE).strip()
+
+    # Ensure the section actually starts with an H2 heading
+    if not text.startswith("## "):
+        first_line, _, rest = text.partition("\n")
+        first_line = first_line.strip()
+        if first_line:
+            text = f"## {first_line}\n{rest}"
+        else:
+            text = f"## {fallback_title}\n\n{rest}"
+
+    return text.strip()
+
+
 def worker_node(payload: dict) -> dict:
     task = Task(**payload["task"])
     plan = Plan(**payload["plan"])
@@ -348,6 +371,8 @@ def worker_node(payload: dict) -> dict:
             ),
         ]
     ).content.strip()
+
+    section_md = _clean_section_heading(section_md, task.title)
 
     return {"sections": [(task.id, section_md)]}
 
