@@ -126,6 +126,11 @@ def router_node(state: State) -> dict:
     else:
         recency_days = 3650
 
+    print(
+        f"[router] mode={decision.mode!r} needs_research={decision.needs_research} "
+        f"reason={decision.reason!r} queries={decision.queries}"
+    )
+
     return {
         "needs_research": decision.needs_research,
         "mode": decision.mode,
@@ -141,11 +146,13 @@ def route_next(state: State) -> str:
 # -----------------------------
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
     if not os.getenv("TAVILY_API_KEY"):
+        print("[research] TAVILY_API_KEY is not set — skipping search, evidence will be empty.")
         return []
     try:
         from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
         tool = TavilySearchResults(max_results=max_results)
         results = tool.invoke({"query": query})
+        print(f"[research] query={query!r} -> {len(results or [])} raw results")
         out: List[dict] = []
         for r in results or []:
             out.append(
@@ -158,7 +165,8 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
                 }
             )
         return out
-    except Exception:
+    except Exception as e:
+        print(f"[research] query={query!r} FAILED: {e}")
         return []
 
 def _iso_to_date(s: Optional[str]) -> Optional[date]:
@@ -188,6 +196,7 @@ def research_node(state: State) -> dict:
         raw.extend(_tavily_search(q, max_results=6))
 
     if not raw:
+        print("[research] no raw results from any query -> evidence will be empty")
         return {"evidence": []}
 
     extractor = llm.with_structured_output(EvidencePack)
@@ -203,6 +212,7 @@ def research_node(state: State) -> dict:
             ),
         ]
     )
+    print(f"[research] extractor produced {len(pack.evidence)} evidence items before dedup/filter")
 
     dedup = {}
     for e in pack.evidence:
@@ -213,8 +223,11 @@ def research_node(state: State) -> dict:
     if state.get("mode") == "open_book":
         as_of = date.fromisoformat(state["as_of"])
         cutoff = as_of - timedelta(days=int(state["recency_days"]))
+        before_filter = len(evidence)
         evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
+        print(f"[research] open_book recency filter: {before_filter} -> {len(evidence)} items (cutoff={cutoff})")
 
+    print(f"[research] final evidence count: {len(evidence)}")
     return {"evidence": evidence}
 
 # -----------------------------
