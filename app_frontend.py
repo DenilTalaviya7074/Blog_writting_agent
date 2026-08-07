@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 
 import pandas as pd
 import streamlit as st
+from groq import APIStatusError
 
 # -----------------------------
 # Import your compiled LangGraph app
@@ -33,6 +34,12 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Stream graph progress if available; else invoke.
     Yields ("updates"/"values"/"final", payload).
+
+    Real Groq API errors (rate limits, bad requests, etc.) are re-raised immediately
+    rather than silently retried — retrying a rate-limit error 3x back-to-back just
+    burns more quota for no benefit. The retry-on-Exception behavior below is only
+    meant to fall back across different LangGraph stream_mode support, not to paper
+    over genuine API failures.
     """
     try:
         for step in graph_app.stream(inputs, stream_mode="updates"):
@@ -40,6 +47,8 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         out = graph_app.invoke(inputs)
         yield ("final", out)
         return
+    except APIStatusError:
+        raise
     except Exception:
         pass
 
@@ -49,6 +58,8 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
         out = graph_app.invoke(inputs)
         yield ("final", out)
         return
+    except APIStatusError:
+        raise
     except Exception:
         pass
 
@@ -253,34 +264,67 @@ if run_btn:
     current_state: Dict[str, Any] = {}
     last_node = None
 
-    for kind, payload in try_stream(app, inputs):
-        if kind in ("updates", "values"):
-            node_name = None
-            if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
-                node_name = next(iter(payload.keys()))
-            if node_name and node_name != last_node:
-                status.write(f"➡️ Node: `{node_name}`")
-                last_node = node_name
+    try:
+        for kind, payload in try_stream(app, inputs):
+            if kind in ("updates", "values"):
+                node_name = None
+                if isinstance(payload, dict) and len(payload) == 1 and isinstance(next(iter(payload.values())), dict):
+                    node_name = next(iter(payload.keys()))
+                if node_name and node_name != last_node:
+                    status.write(f"➡️ Node: `{node_name}`")
+                    last_node = node_name
 
-            current_state = extract_latest_state(current_state, payload)
+                current_state = extract_latest_state(current_state, payload)
 
-            summary = {
-                "mode": current_state.get("mode"),
-                "needs_research": current_state.get("needs_research"),
-                "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
-                "evidence_count": len(current_state.get("evidence", []) or []),
-                "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
-                "sections_done": len(current_state.get("sections", []) or []),
-            }
-            progress_area.json(summary)
+                summary = {
+                    "mode": current_state.get("mode"),
+                    "needs_research": current_state.get("needs_research"),
+                    "queries": current_state.get("queries", [])[:5] if isinstance(current_state.get("queries"), list) else [],
+                    "evidence_count": len(current_state.get("evidence", []) or []),
+                    "tasks": len((current_state.get("plan") or {}).get("tasks", [])) if isinstance(current_state.get("plan"), dict) else None,
+                    "sections_done": len(current_state.get("sections", []) or []),
+                }
+                progress_area.json(summary)
 
-            log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
+                log(f"[{kind}] {json.dumps(payload, default=str)[:1200]}")
 
-        elif kind == "final":
-            out = payload
-            st.session_state["last_out"] = out
-            status.update(label="✅ Done", state="complete", expanded=False)
-            log("[final] received final state")
+            elif kind == "final":
+                out = payload
+                st.session_state["last_out"] = out
+                status.update(label="✅ Done", state="complete", expanded=False)
+                log("[final] received final state")
+
+    except APIStatusError as e:
+        status.update(label="❌ Stopped", state="error", expanded=False)
+        msg = str(e)
+        wait_match = re.search(r"try again in ([\d.]+)s", msg) or re.search(r"try again in (\d+)m([\d.]+)s", msg)
+        code = getattr(e, "status_code", None)
+
+        if code == 429:
+            retry_hint = ""
+            m = re.search(r"try again in (\d+)m([\d.]+)s", msg)
+            if m:
+                retry_hint = f" (Groq suggests waiting about {m.group(1)}m {int(float(m.group(2)))}s)"
+            else:
+                m2 = re.search(r"try again in ([\d.]+)s", msg)
+                if m2:
+                    retry_hint = f" (Groq suggests waiting about {int(float(m2.group(1)))}s)"
+            st.error(
+                f"⏳ Groq rate/quota limit reached{retry_hint}. "
+                "This is a Groq account limit, not a bug in the app — wait and try again, "
+                "or switch to a lighter model (e.g. `llama-3.1-8b-instant`) if this happens often.",
+                icon="⏳",
+            )
+        elif code == 400:
+            st.error(
+                "⚠️ The model's response didn't match the expected format for this step "
+                "(a structured-output call failed). Try again — this is usually transient.",
+                icon="⚠️",
+            )
+        else:
+            st.error(f"❌ Groq API error ({code}): {msg[:300]}", icon="❌")
+
+        log(f"[error] Groq API error: {msg}")
 
 # Render last result (if any)
 out = st.session_state.get("last_out")

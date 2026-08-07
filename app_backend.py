@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import operator
 import os
 import re
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -12,7 +14,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
@@ -91,7 +93,22 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOllama(model="gemma3:4b")
+# Plain prose generation (worker sections) — tight cap is fine and desirable for speed,
+# since a truncated section is still usable text, just shorter than intended.
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.4,
+    max_tokens=900,
+)
+
+# Structured/JSON tool-calling outputs (router, research extractor, orchestrator planner) —
+# these need a much bigger budget. Unlike plain prose, a truncated JSON tool call isn't
+# just shorter, it's *invalid* — Groq can't parse partial JSON and throws tool_use_failed.
+llm_structured = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.2,
+    max_tokens=3000,
+)
 
 # -----------------------------
 # 3) Router
@@ -111,7 +128,7 @@ If needs_research=true:
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
+    decider = llm_structured.with_structured_output(RouterDecision)
     decision = decider.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
@@ -155,11 +172,14 @@ def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
         print(f"[research] query={query!r} -> {len(results or [])} raw results")
         out: List[dict] = []
         for r in results or []:
+            snippet = (r.get("content") or r.get("snippet") or "").strip()
+            if len(snippet) > 280:
+                snippet = snippet[:280].rsplit(" ", 1)[0] + "..."
             out.append(
                 {
-                    "title": r.get("title") or "",
+                    "title": (r.get("title") or "")[:150],
                     "url": r.get("url") or "",
-                    "snippet": r.get("content") or r.get("snippet") or "",
+                    "snippet": snippet,
                     "published_at": r.get("published_date") or r.get("published_at"),
                     "source": r.get("source"),
                 }
@@ -190,16 +210,23 @@ Rules:
 """
 
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:10]
+    queries = (state.get("queries") or [])[:6]
     raw: List[dict] = []
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        raw.extend(_tavily_search(q, max_results=4))
+
+    # Hard cap total items sent to the extractor, regardless of how many
+    # queries/results came back — this is what actually protects the TPM limit.
+    MAX_RAW_ITEMS = 15
+    if len(raw) > MAX_RAW_ITEMS:
+        print(f"[research] trimming raw results from {len(raw)} to {MAX_RAW_ITEMS} to stay under token limits")
+        raw = raw[:MAX_RAW_ITEMS]
 
     if not raw:
         print("[research] no raw results from any query -> evidence will be empty")
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
+    extractor = llm_structured.with_structured_output(EvidencePack)
     pack = extractor.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -207,7 +234,7 @@ def research_node(state: State) -> dict:
                 content=(
                     f"As-of date: {state['as_of']}\n"
                     f"Recency days: {state['recency_days']}\n\n"
-                    f"Raw results:\n{raw}"
+                    f"Raw results:\n{json.dumps(raw, ensure_ascii=False)}"
                 )
             ),
         ]
@@ -237,7 +264,8 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 5–9 tasks, each with goal + 3–6 bullets + target_words.
+- 3–5 tasks, each with goal + 3–5 bullets + target_words.
+- Keep target_words modest: 150–300 words per section unless the topic truly needs more.
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -252,7 +280,7 @@ Output must match Plan schema.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
+    planner = llm_structured.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
@@ -353,10 +381,13 @@ def worker_node(payload: dict) -> dict:
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
-    evidence_text = "\n".join(
-        f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
-        for e in evidence[:20]
-    )
+    if task.requires_research or task.requires_citations:
+        evidence_text = "\n".join(
+            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
+            for e in evidence[:8]
+        ) or "(none)"
+    else:
+        evidence_text = "(not needed for this section)"
 
     section_md = llm.invoke(
         [
@@ -416,12 +447,30 @@ def reducer_node(state: State) -> dict:
 # -----------------------------
 # 9) Build main graph
 # -----------------------------
+def _timed(name: str, fn):
+    """Wraps a node function to log wall-clock start/end/duration.
+    Start/end timestamps let you see whether 'parallel' workers actually
+    overlap in wall-clock time, or queue up sequentially on the Ollama side."""
+    def wrapped(payload):
+        t0 = time.perf_counter()
+        started_at = time.strftime("%H:%M:%S")
+        print(f"[timing] {name} START at {started_at}")
+        try:
+            result = fn(payload)
+            return result
+        finally:
+            elapsed = time.perf_counter() - t0
+            ended_at = time.strftime("%H:%M:%S")
+            print(f"[timing] {name} END   at {ended_at}  ({elapsed:.1f}s)")
+    return wrapped
+
+
 g = StateGraph(State)
-g.add_node("router", router_node)
-g.add_node("research", research_node)
-g.add_node("orchestrator", orchestrator_node)
-g.add_node("worker", worker_node)
-g.add_node("reducer", reducer_node)
+g.add_node("router", _timed("router", router_node))
+g.add_node("research", _timed("research", research_node))
+g.add_node("orchestrator", _timed("orchestrator", orchestrator_node))
+g.add_node("worker", _timed("worker", worker_node))
+g.add_node("reducer", _timed("reducer", reducer_node))
 
 g.add_edge(START, "router")
 g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
